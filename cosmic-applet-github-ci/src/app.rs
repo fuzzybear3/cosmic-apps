@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::fl;
 use crate::github::{self, OverallStatus, RepoRuns};
+use chrono::{DateTime, Utc};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::{stream, window::Id, Color, Length, Limits, Subscription};
 use cosmic::iced_winit::commands::popup::{destroy_popup, get_popup};
@@ -30,8 +31,18 @@ pub struct AppModel {
     /// HTTP client; Option only to satisfy Default (always Some after init).
     client: Option<reqwest::Client>,
 
-    /// Phase counter for the pulsing progress bar (0.0..=1.0, cycles).
+    /// Phase counter for the fallback pulse animation (0.0..=1.0).
     animation_phase: f32,
+
+    /// When the current running workflow started (from its created_at field).
+    running_start: Option<DateTime<Utc>>,
+
+    /// Duration of the previous completed run of the same workflow, in seconds.
+    /// Used to estimate progress of the currently running run.
+    estimated_duration_secs: Option<f32>,
+
+    /// Computed progress 0.0..=1.0 when we have enough data; None = pulse fallback.
+    panel_progress: Option<f32>,
 }
 
 // ─── Messages ────────────────────────────────────────────────────────────────
@@ -140,9 +151,11 @@ impl cosmic::Application for AppModel {
             .on_press(Message::TogglePopup);
 
         if self.overall == OverallStatus::Running {
-            // Pulsing indeterminate progress bar: sin wave 0 → 1.
-            let phase = self.animation_phase * std::f32::consts::TAU;
-            let progress = (phase.sin() + 1.0) / 2.0;
+            // Use real progress if we have an estimate, otherwise pulse.
+            let progress = self.panel_progress.unwrap_or_else(|| {
+                let phase = self.animation_phase * std::f32::consts::TAU;
+                (phase.sin() + 1.0) / 2.0
+            });
 
             widget::column()
                 .push(icon_btn)
@@ -317,6 +330,43 @@ impl cosmic::Application for AppModel {
 
             Message::RunsFetched(runs) => {
                 self.overall = github::compute_overall(&runs);
+
+                // Find the first running workflow and look for a previous completed
+                // run of the same name to use as a duration estimate.
+                self.running_start = None;
+                self.estimated_duration_secs = None;
+                self.panel_progress = None;
+
+                'outer: for repo_runs in &runs {
+                    for run in &repo_runs.runs {
+                        if !run.is_running() {
+                            continue;
+                        }
+                        // Parse start time of the currently running workflow.
+                        if let Some(start) = run.created_at.as_deref()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.with_timezone(&chrono::Utc))
+                        {
+                            self.running_start = Some(start);
+                        }
+
+                        // Look for a previous completed run with the same workflow name.
+                        let target_name = run.name.as_deref();
+                        for prev in &repo_runs.runs {
+                            if prev.id == run.id {
+                                continue;
+                            }
+                            if prev.name.as_deref() == target_name {
+                                if let Some(dur) = prev.completed_duration_secs() {
+                                    self.estimated_duration_secs = Some(dur);
+                                    break;
+                                }
+                            }
+                        }
+                        break 'outer;
+                    }
+                }
+
                 self.all_runs = runs;
             }
 
@@ -329,8 +379,17 @@ impl cosmic::Application for AppModel {
             }
 
             Message::AnimationTick => {
-                // Advance phase ~0.033 per 100ms → full cycle ≈ 3 seconds.
+                // Advance the fallback pulse animation phase.
                 self.animation_phase = (self.animation_phase + 0.033) % 1.0;
+
+                // If we have timing data, compute real progress.
+                if let (Some(start), Some(duration)) =
+                    (self.running_start, self.estimated_duration_secs)
+                {
+                    let elapsed = (chrono::Utc::now() - start).num_seconds() as f32;
+                    // Cap at 0.99 so it never shows 100% until the run completes.
+                    self.panel_progress = Some((elapsed / duration).clamp(0.0, 0.99));
+                }
             }
         }
 

@@ -11,6 +11,7 @@ name = "cosmic-applet-github-ci"
 path = "src/main.rs"
 
 [dependencies]
+chrono = "0.4"
 futures = "0.3"
 futures-util = "0.3.31"
 i18n-embed-fl = "0.10"

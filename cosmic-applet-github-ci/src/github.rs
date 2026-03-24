@@ -38,9 +38,39 @@ pub struct WorkflowRun {
     pub status: Option<String>,
     /// "success" | "failure" | "cancelled" | "timed_out" | "skipped" | null
     pub conclusion: Option<String>,
-    /// ISO-8601 timestamp of last update, e.g. "2024-01-15T10:30:00Z"
+    /// ISO-8601 — when the run was created/queued.
+    pub created_at: Option<String>,
+    /// ISO-8601 — when the run was last updated (end time for completed runs).
     pub updated_at: Option<String>,
     pub html_url: String,
+}
+
+fn parse_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+impl WorkflowRun {
+    /// Duration in seconds for a completed run (updated_at − created_at).
+    /// Returns None if the run is not completed or timestamps are missing.
+    pub fn completed_duration_secs(&self) -> Option<f32> {
+        if self.status.as_deref() != Some("completed") {
+            return None;
+        }
+        let start = parse_ts(self.created_at.as_deref()?)?;
+        let end = parse_ts(self.updated_at.as_deref()?)?;
+        let secs = (end - start).num_seconds();
+        if secs > 0 { Some(secs as f32) } else { None }
+    }
+
+    /// Elapsed seconds since this run started (for in-progress runs).
+    pub fn elapsed_secs(&self) -> Option<f32> {
+        if !self.is_running() {
+            return None;
+        }
+        let start = parse_ts(self.created_at.as_deref()?)?;
+        let elapsed = (chrono::Utc::now() - start).num_seconds();
+        if elapsed >= 0 { Some(elapsed as f32) } else { None }
+    }
 }
 
 impl WorkflowRun {
