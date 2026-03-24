@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=GitHub CI Status
+Comment=Show GitHub Actions workflow status in the COSMIC panel
+Type=Application
+Exec=cosmic-applet-github-ci
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;GitHub;CI;CD;Actions;
+Icon=io.github.fuzzybear3.CosmicAppletGithubCi
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto

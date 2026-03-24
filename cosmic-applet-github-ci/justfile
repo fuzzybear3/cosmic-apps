@@ -1,0 +1,43 @@
+name  := 'cosmic-applet-github-ci'
+appid := 'io.github.fuzzybear3.CosmicAppletGithubCi'
+
+rootdir := ''
+prefix  := '/usr'
+
+base-dir     := absolute_path(clean(rootdir / prefix))
+target-dir   := env('CARGO_TARGET_DIR', 'target')
+bin-dst      := base-dir / 'bin' / name
+desktop-dst  := base-dir / 'share' / 'applications' / appid + '.desktop'
+appdata-dst  := base-dir / 'share' / 'appdata' / appid + '.metainfo.xml'
+
+default: build-release
+
+clean:
+    cargo clean
+
+build-debug *args:
+    cargo build {{args}}
+
+build-release *args: (build-debug '--release' args)
+
+check *args:
+    cargo clippy --all-features {{args}} -- -W clippy::pedantic
+
+run *args:
+    env RUST_LOG=debug RUST_BACKTRACE=full cargo run --release {{args}}
+
+install:
+    install -Dm0755 {{target-dir}}/release/{{name}} {{bin-dst}}
+    install -Dm0644 resources/app.desktop {{desktop-dst}}
+    install -Dm0644 resources/app.metainfo.xml {{appdata-dst}}
+
+uninstall:
+    rm -f {{bin-dst}} {{desktop-dst}} {{appdata-dst}}
+
+# Install to ~/.local for development testing without root
+install-local:
+    install -Dm0755 {{target-dir}}/release/{{name}} \
+        ~/.local/bin/{{name}}
+    install -Dm0644 resources/app.desktop \
+        ~/.local/share/applications/{{appid}}.desktop
+    update-desktop-database ~/.local/share/applications/ || true

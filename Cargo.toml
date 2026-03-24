@@ -1,0 +1,3 @@
+[workspace]
+members = ["cosmic-applet-github-ci"]
+resolver = "2"

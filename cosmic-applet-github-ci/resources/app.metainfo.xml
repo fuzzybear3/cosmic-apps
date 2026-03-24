@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.fuzzybear3.CosmicAppletGithubCi</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>GitHub CI Status</name>
+  <summary>COSMIC panel applet for GitHub Actions workflow status</summary>
+  <launchable type="desktop-id">io.github.fuzzybear3.CosmicAppletGithubCi.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+</component>
