@@ -5,6 +5,7 @@ A collection of custom COSMIC desktop panel applets.
 ## Applets
 
 - [cosmic-applet-github-ci](cosmic-applet-github-ci/) — GitHub Actions workflow status
+- [cosmic-applet-claude-sessions](cosmic-applet-claude-sessions/) — running Claude Code sessions & which need attention
 
 ---
 

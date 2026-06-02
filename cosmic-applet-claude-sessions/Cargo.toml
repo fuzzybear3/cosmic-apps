@@ -6,9 +6,17 @@ license = "GPL-3.0-only"
 description = "COSMIC panel applet showing running Claude Code sessions and which need attention"
 repository = "https://github.com/fuzzybear3/cosmic-apps"
 
+[lib]
+name = "cosmic_applet_claude_sessions"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cosmic-applet-claude-sessions"
 path = "src/main.rs"
+
+[[bin]]
+name = "cosmic-claude-attention-card"
+path = "src/bin/cosmic-claude-attention-card.rs"
 
 [dependencies]
 futures = "0.3"

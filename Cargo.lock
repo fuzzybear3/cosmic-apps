@@ -839,6 +839,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmic-applet-claude-sessions"
+version = "0.1.0"
+dependencies = [
+ "calloop",
+ "calloop-wayland-source",
+ "cosmic-client-toolkit",
+ "futures",
+ "futures-util",
+ "libcosmic",
+ "serde",
+ "serde_json",
+ "smithay-client-toolkit",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cosmic-applet-github-ci"
 version = "0.1.0"
 dependencies = [

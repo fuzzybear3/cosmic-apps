@@ -39,9 +39,6 @@ pub struct AppModel {
 
     /// Shared tty -> live window title (Claude's task topic), from that thread.
     focus_titles: Option<focus::SharedTitles>,
-
-    /// Last seen state per session id, for detecting transitions.
-    prev_states: HashMap<String, SessionState>,
 }
 
 // ─── Messages ────────────────────────────────────────────────────────────────
@@ -292,31 +289,11 @@ impl cosmic::Application for AppModel {
                     }
                 }
 
-                // Detect a session that has newly entered the waiting state, to
-                // pop up the attention card. Requires a known previous state so
-                // pre-existing waiting sessions don't fire on first sight.
-                // Notify (once) when a session newly enters the waiting state.
-                // Requires a known previous state so pre-existing waiting
-                // sessions don't fire on first sight.
-                let notify_body = sessions
-                    .iter()
-                    .find(|s| {
-                        matches!(
-                            self.prev_states.get(&s.session_id).copied(),
-                            Some(p) if p != SessionState::Attention
-                        ) && s.state == SessionState::Attention
-                    })
-                    .map(|s| format!("{} needs your attention", self.session_label(s)));
-                self.prev_states = sessions
-                    .iter()
-                    .map(|s| (s.session_id.clone(), s.state))
-                    .collect();
-
+                // Attention alerts are owned by the standalone
+                // `cosmic-claude-attention-card` daemon (a custom layer-shell
+                // card), not the applet. The applet just reflects the current
+                // state in its panel icon and popup.
                 self.sessions = sessions;
-
-                if let Some(body) = notify_body {
-                    send_notification(&body);
-                }
             }
 
             Message::Focus { pid } => {
@@ -393,39 +370,4 @@ fn strip_glyph(s: &str) -> String {
     s.trim_start_matches(|c: char| !c.is_alphanumeric())
         .trim()
         .to_string()
-}
-
-/// Fire a COSMIC desktop notification via gdbus (fire-and-forget). Auto-dismisses
-/// after a few seconds (the persistent "still waiting" state is shown by the
-/// panel icon, not the banner). cosmic-panel runs the applet as two processes
-/// that both reach this; a deterministic `replaces_id` (hash of the body)
-/// collapses the two identical notifications into one instead of stacking.
-fn send_notification(body: &str) {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    body.hash(&mut h);
-    let replaces_id = (h.finish() as u32).max(1).to_string();
-
-    let _ = std::process::Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.freedesktop.Notifications",
-            "--object-path",
-            "/org/freedesktop/Notifications",
-            "--method",
-            "org.freedesktop.Notifications.Notify",
-            "Claude Code",
-            replaces_id.as_str(),
-            "dialog-warning-symbolic",
-            "Claude Code",
-            body,
-            "[]",
-            "{}",
-            "8000",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
