@@ -26,8 +26,10 @@
 //! click-to-focus. Cards auto-dismiss after a TTL; clicking one focuses that
 //! session.
 
+use crate::config::{self, Config};
 use crate::focus;
 use crate::sessions::{self, Session};
+use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::{stream, window::Id, Alignment, Color, Length, Limits, Subscription};
 use cosmic::iced_runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, SctkLayerSurfaceSettings,
@@ -163,6 +165,11 @@ pub struct CardApp {
     /// the "finished" card on how long the turn ran.
     turn_start: HashMap<String, Instant>,
 
+    /// Shared config (applet's namespace) — `mute_focused` lives here.
+    config: Config,
+    /// Shared: the tty of the currently focused window, to mute its card.
+    focused_tty: Option<focus::FocusedTty>,
+
     /// Cards on screen, left → right, oldest → newest. One per session.
     cards: Vec<Card>,
     /// The single layer surface holding the row of cards, if any.
@@ -189,6 +196,8 @@ pub enum Message {
     Focus(String),
     /// The surface was closed by the compositor.
     SurfaceClosed(Id),
+    /// The shared config changed (e.g. the mute toggle in the applet popup).
+    UpdateConfig(Config),
 }
 
 type MsgStream = Pin<Box<dyn futures_util::Stream<Item = Message> + Send + 'static>>;
@@ -228,14 +237,25 @@ impl cosmic::Application for CardApp {
         // stale cards.
         clear_spool();
 
-        let (focus_tx, focus_titles) = match focus::spawn() {
-            Some((tx, titles)) => (Some(tx), Some(titles)),
-            None => (None, None),
+        let (focus_tx, focus_titles, focused_tty) = match focus::spawn() {
+            Some((tx, titles, focused)) => (Some(tx), Some(titles), Some(focused)),
+            None => (None, None, None),
         };
+
+        // Read the applet's config (shared cosmic-config namespace).
+        let config = cosmic_config::Config::new(config::APPLET_APP_ID, Config::VERSION)
+            .map(|ctx| match Config::get_entry(&ctx) {
+                Ok(c) => c,
+                Err((_errs, c)) => c,
+            })
+            .unwrap_or_default();
+
         let app = CardApp {
             core,
             focus_tx,
             focus_titles,
+            focused_tty,
+            config,
             ..Default::default()
         };
         (
@@ -273,7 +293,12 @@ impl cosmic::Application for CardApp {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        Subscription::run_with(0u8, refresh_stream)
+        let refresh = Subscription::run_with(0u8, refresh_stream);
+        let config_watch = self
+            .core()
+            .watch_config::<Config>(config::APPLET_APP_ID)
+            .map(|update| Message::UpdateConfig(update.config));
+        Subscription::batch([refresh, config_watch])
     }
 
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
@@ -312,6 +337,8 @@ impl cosmic::Application for CardApp {
                     self.cards.clear();
                 }
             }
+
+            Message::UpdateConfig(config) => self.config = config,
         }
         Task::none()
     }
@@ -350,6 +377,19 @@ impl CardApp {
             };
 
             let sess = sessions.iter().find(|s| s.session_id == sid);
+
+            // Mute the card if you're already focused on this session's window.
+            if self.config.mute_focused {
+                let session_tty = sess.and_then(|s| s.tty.clone());
+                let focused = self
+                    .focused_tty
+                    .as_ref()
+                    .and_then(|f| f.lock().ok().and_then(|g| g.clone()));
+                if session_tty.is_some() && session_tty == focused {
+                    continue;
+                }
+            }
+
             let label = sess
                 .map(|s| self.session_label(s))
                 .unwrap_or_else(|| project_of(&cwd));

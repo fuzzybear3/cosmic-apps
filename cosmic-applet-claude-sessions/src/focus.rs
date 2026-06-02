@@ -20,6 +20,7 @@ use sctk::{
     seat::{Capability, SeatHandler, SeatState},
 };
 use cosmic_client_toolkit::{
+    cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1,
     cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
     toplevel_info::{ToplevelInfoHandler, ToplevelInfoState},
     toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
@@ -46,22 +47,29 @@ pub type FocusSender = calloop::channel::Sender<FocusRequest>;
 /// prompt (title is "[pts/N] …", no active task).
 pub type SharedTitles = Arc<Mutex<HashMap<String, String>>>;
 
-/// Spawn the background Wayland thread. Returns a channel for focus requests and
-/// a shared map of tty -> live window title. Sends are fire-and-forget; if the
-/// compositor lacks the protocols the thread exits and the map stays empty.
-pub fn spawn() -> Option<(FocusSender, SharedTitles)> {
+/// Shared (focus thread -> UI thread): the tty ("pts/N") of the currently
+/// focused/activated window, when it maps to a tracked session; else None.
+pub type FocusedTty = Arc<Mutex<Option<String>>>;
+
+/// Spawn the background Wayland thread. Returns a channel for focus requests, a
+/// shared map of tty -> live window title, and the focused window's tty. Sends
+/// are fire-and-forget; if the compositor lacks the protocols the thread exits
+/// and the shared state stays empty.
+pub fn spawn() -> Option<(FocusSender, SharedTitles, FocusedTty)> {
     let (tx, channel) = calloop::channel::channel::<FocusRequest>();
     let titles: SharedTitles = Arc::new(Mutex::new(HashMap::new()));
+    let focused: FocusedTty = Arc::new(Mutex::new(None));
     let titles_thread = titles.clone();
+    let focused_thread = focused.clone();
     std::thread::Builder::new()
         .name("claude-focus-wl".into())
         .spawn(move || {
-            if let Err(e) = run(channel, titles_thread) {
+            if let Err(e) = run(channel, titles_thread, focused_thread) {
                 tracing::warn!("focus wayland thread exited: {e}");
             }
         })
         .ok()?;
-    Some((tx, titles))
+    Some((tx, titles, focused))
 }
 
 // ─── tmux ────────────────────────────────────────────────────────────────────
@@ -135,11 +143,15 @@ struct AppData {
     tty_to_identifier: HashMap<String, String>,
     /// Published to the UI thread: tty -> current window title (the task topic).
     titles: SharedTitles,
+    /// Published to the UI thread: the focused window's tty (if it's a tracked
+    /// session), so the daemon can mute that session's card.
+    focused_tty: FocusedTty,
 }
 
 fn run(
     channel: calloop::channel::Channel<FocusRequest>,
     titles: SharedTitles,
+    focused_tty: FocusedTty,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init::<AppData>(&conn)?;
@@ -160,6 +172,7 @@ fn run(
         conn: conn.clone(),
         tty_to_identifier: HashMap::new(),
         titles,
+        focused_tty,
     };
 
     let mut event_loop = calloop::EventLoop::<AppData>::try_new()?;
@@ -208,6 +221,30 @@ fn activate_matching(app: &mut AppData, req: &FocusRequest) {
     if let Some(handle) = handle {
         app.toplevel_manager.manager.activate(&handle, &seat);
         let _ = app.conn.flush();
+    }
+}
+
+/// Recompute which tty owns the currently focused (activated) toplevel and
+/// publish it. Scans all toplevels for the one in the `Activated` state, then
+/// reverse-maps its identifier through the captured tty->identifier table. None
+/// if the focused window isn't a tracked session (e.g. a browser).
+fn recompute_focus(app: &mut AppData) {
+    let active_id = app
+        .toplevel_info
+        .toplevels()
+        .find(|info| {
+            info.state
+                .contains(&zcosmic_toplevel_handle_v1::State::Activated)
+        })
+        .map(|info| info.identifier.clone());
+    let tty = active_id.and_then(|id| {
+        app.tty_to_identifier
+            .iter()
+            .find(|(_, v)| **v == id)
+            .map(|(k, _)| k.clone())
+    });
+    if let Ok(mut f) = app.focused_tty.lock() {
+        *f = tty;
     }
 }
 
@@ -300,6 +337,7 @@ impl ToplevelInfoHandler for AppData {
                 }
             }
         }
+        recompute_focus(self);
     }
     fn toplevel_closed(
         &mut self,
@@ -323,6 +361,7 @@ impl ToplevelInfoHandler for AppData {
                 m.remove(&pts);
             }
         }
+        recompute_focus(self);
     }
 }
 

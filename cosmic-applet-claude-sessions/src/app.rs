@@ -50,6 +50,7 @@ pub enum Message {
     Refresh,
     Focus { pid: i32 },
     UpdateConfig(Config),
+    SetMuteFocused(bool),
 }
 
 // ─── Stream builders ─────────────────────────────────────────────────────────
@@ -119,7 +120,7 @@ impl cosmic::Application for AppModel {
             .unwrap_or_default();
 
         let (focus_tx, focus_titles) = match focus::spawn() {
-            Some((tx, titles)) => (Some(tx), Some(titles)),
+            Some((tx, titles, _focused)) => (Some(tx), Some(titles)),
             None => (None, None),
         };
         let app = AppModel {
@@ -221,6 +222,12 @@ impl cosmic::Application for AppModel {
                 );
             }
         }
+
+        content = content.push(
+            widget::toggler(self.config.mute_focused)
+                .label("Mute the focused session".to_string())
+                .on_toggle(Message::SetMuteFocused),
+        );
 
         self.core.applet.popup_container(content).into()
     }
@@ -324,6 +331,16 @@ impl cosmic::Application for AppModel {
             Message::UpdateConfig(new_config) => {
                 self.config = new_config;
                 return self.update(Message::Refresh);
+            }
+
+            Message::SetMuteFocused(value) => {
+                // Persist to cosmic-config; the daemon watches the same key.
+                match cosmic_config::Config::new(Self::APP_ID, Config::VERSION) {
+                    Ok(ctx) => {
+                        let _ = self.config.set_mute_focused(&ctx, value);
+                    }
+                    Err(_) => self.config.mute_focused = value,
+                }
             }
         }
 
