@@ -1,23 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! A standalone COSMIC **layer-shell daemon** that shows a custom "needs your
-//! attention" card when a Claude Code session transitions into the waiting
-//! state.
+//! A standalone COSMIC **layer-shell daemon** that shows custom cards when
+//! Claude Code sessions want your attention.
 //!
 //! Why a separate process? The panel applet cannot create its own surface —
 //! doing so crashes the applet. A standalone libcosmic app *can* own a
-//! layer-shell surface, which gives full control over the card's look,
-//! placement and behaviour (beyond what the notification daemon exposes).
+//! layer-shell surface, which gives full control over the cards' look and
+//! placement (beyond what the notification daemon exposes).
 //!
-//! It runs with no main window, sits idle most of the time, and on a
-//! `→waiting` transition spawns a top-right layer surface. Clicking the card
-//! focuses the session's terminal window — reusing the exact same native cctk
-//! activation as the applet (`focus`). The card auto-dismisses after a short
-//! TTL or as soon as the session stops waiting; the persistent "still waiting"
-//! indication is the applet's panel icon, not this card.
+//! **Triggers are hook-driven.** Claude Code hooks (wired in `settings.json`)
+//! run `card-hook.sh <label>`, which spools the hook's JSON into
+//! `~/.claude/card-events/`. This daemon polls that spool (1 s) and shows the
+//! matching card:
+//!   - `stop`        → "Claude finished" (gated on turn length, see below)
+//!   - `error`       → "Claude hit an error" (StopFailure: rate limit, etc.)
+//!   - `permission`  → "Claude needs permission" (+ tool name)
+//!   - `idle`        → "Claude is waiting for you" (Notification/idle_prompt)
+//!   - `turnstart`   → (no card) records turn start, to measure turn length
+//!
+//! Multiple sessions stack as a **row of cards across the top of the screen**,
+//! anchored under the panel applet and growing rightward (one card per session;
+//! a newer event for the same session updates its card in place). The hook
+//! payload only carries `session_id`/`cwd`, so the daemon loads the registry to
+//! resolve `session_id → pid → tty → window` for the live task label and for
+//! click-to-focus. Cards auto-dismiss after a TTL; clicking one focuses that
+//! session.
 
 use crate::focus;
-use crate::sessions::{self, Session, SessionState};
+use crate::sessions::{self, Session};
 use cosmic::iced::{stream, window::Id, Alignment, Color, Length, Limits, Subscription};
 use cosmic::iced_runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, SctkLayerSurfaceSettings,
@@ -29,7 +39,9 @@ use cosmic::prelude::*;
 use cosmic::widget;
 use futures::channel::mpsc;
 use futures_util::SinkExt as _;
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -37,21 +49,30 @@ use tokio::time;
 
 const APP_ID: &str = "io.github.fuzzybear3.CosmicClaudeAttentionCard";
 
-/// How long the card stays up before auto-dismissing. The ongoing "still
-/// waiting" state remains visible via the applet's panel icon.
+/// How long a card stays up before auto-dismissing.
 const CARD_TTL: Duration = Duration::from_secs(10);
 
-/// Placement of the card, anchored to the top-left so it drops from under the
-/// session-tracker applet (which lives in the panel's left wing). The daemon
-/// can't read the applet's exact pixel position (panel applets aren't normal
-/// windows), so these are tuned to sit under its icon — nudge `LEFT` to slide
-/// the card horizontally, `TOP` for the gap below the panel.
+/// A "finished" (Stop) card only fires when the turn ran at least this long, so
+/// quick back-and-forth replies don't spam a card while you're actively
+/// chatting. Set to `Duration::ZERO` to card on every turn.
+const FINISHED_MIN_BUSY: Duration = Duration::from_secs(1);
+
+/// Placement of the row of cards, anchored to the top-left so it drops from
+/// under the session-tracker applet (which lives in the panel's left wing).
+/// Nudge `LEFT` to slide it horizontally, `TOP` for the gap below the panel.
 const CARD_MARGIN_LEFT: i32 = 100;
 const CARD_MARGIN_TOP: i32 = 8;
 
+/// Each card's fixed width, the gap between them, and how many stack before the
+/// oldest is dropped. `MAX_ROW_WIDTH` bounds the layer surface.
+const CARD_WIDTH: f32 = 280.0;
+const CARD_GAP: f32 = 8.0;
+const MAX_CARDS: usize = 4;
+const MAX_ROW_WIDTH: f32 = CARD_WIDTH * MAX_CARDS as f32 + CARD_GAP * MAX_CARDS as f32 + 16.0;
+
 /// Stable widget id so the autosize widget can drive the layer surface size.
 static AUTOSIZE_ID: LazyLock<cosmic::widget::Id> =
-    LazyLock::new(|| cosmic::widget::Id::new("claude-attention-card"));
+    LazyLock::new(|| cosmic::widget::Id::new("claude-attention-cards"));
 
 /// Launch the daemon. No main window: it stays alive with zero surfaces and
 /// only creates one on demand.
@@ -62,6 +83,73 @@ pub fn run() -> cosmic::iced::Result {
     cosmic::app::run::<CardApp>(settings, ())
 }
 
+// ─── What kind of attention a card represents ─────────────────────────────────
+
+#[derive(Debug, Clone)]
+enum CardKind {
+    /// Stop — Claude finished a (long enough) turn.
+    Finished,
+    /// StopFailure — the turn ended with an API error.
+    Error,
+    /// PermissionRequest — a tool needs your approval (carries the tool name).
+    Permission(Option<String>),
+    /// Notification/idle_prompt — Claude has been waiting for your input.
+    Waiting,
+}
+
+impl CardKind {
+    fn headline(&self) -> String {
+        match self {
+            CardKind::Finished => "Claude finished".to_string(),
+            CardKind::Error => "Claude hit an error".to_string(),
+            CardKind::Permission(tool) => match tool.as_deref() {
+                Some(t) if !t.is_empty() => format!("Needs permission · {t}"),
+                _ => "Claude needs permission".to_string(),
+            },
+            CardKind::Waiting => "Claude is waiting for you".to_string(),
+        }
+    }
+
+    fn icon_name(&self) -> &'static str {
+        match self {
+            CardKind::Finished => "emblem-ok-symbolic",
+            CardKind::Error => "dialog-error-symbolic",
+            CardKind::Permission(_) | CardKind::Waiting => "dialog-warning-symbolic",
+        }
+    }
+
+    /// Accent colour (left strip + icon), from the cosmic palette.
+    fn accent(&self, theme: &cosmic::Theme) -> Color {
+        let c = theme.cosmic();
+        match self {
+            CardKind::Finished => Color::from(c.success.base),
+            CardKind::Error => Color::from(c.destructive.base),
+            CardKind::Permission(_) | CardKind::Waiting => Color::from(c.warning.base),
+        }
+    }
+}
+
+// ─── Spool events (written by card-hook.sh) ───────────────────────────────────
+
+#[derive(Deserialize)]
+struct SpoolEvent {
+    event: String,
+    #[serde(default)]
+    hook: HookPayload,
+}
+
+#[derive(Default, Deserialize)]
+struct HookPayload {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    tool_name: Option<String>,
+}
+
+// ─── App model ────────────────────────────────────────────────────────────────
+
 #[derive(Default)]
 pub struct CardApp {
     core: cosmic::Core,
@@ -71,18 +159,23 @@ pub struct CardApp {
     /// Shared tty -> live window title (Claude's task topic), from that thread.
     focus_titles: Option<focus::SharedTitles>,
 
-    /// Last seen state per session id, for detecting →waiting transitions.
-    prev_states: HashMap<String, SessionState>,
+    /// Turn start time per session id (from `turnstart` events), used to gate
+    /// the "finished" card on how long the turn ran.
+    turn_start: HashMap<String, Instant>,
 
-    /// The card currently on screen, if any.
-    card: Option<Card>,
+    /// Cards on screen, left → right, oldest → newest. One per session.
+    cards: Vec<Card>,
+    /// The single layer surface holding the row of cards, if any.
+    surface: Option<Id>,
 }
 
-/// The session a visible card is describing.
+/// A visible card.
 struct Card {
-    id: Id,
-    pid: i32,
+    /// Session id — dedup key (one card per session) and click target.
     session_id: String,
+    /// The session's pid, for click-to-focus; None if it wasn't in the registry.
+    pid: Option<i32>,
+    kind: CardKind,
     label: String,
     project: String,
     shown_at: Instant,
@@ -90,17 +183,17 @@ struct Card {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// 1 s heartbeat: re-scan the registry, fire/dismiss the card.
+    /// 1 s heartbeat: drain the spool, fire/expire cards.
     Refresh,
-    /// The card was clicked: focus the session and dismiss.
-    Focus,
-    /// A surface was closed by the compositor.
+    /// A card was clicked (by session id): focus that session and dismiss it.
+    Focus(String),
+    /// The surface was closed by the compositor.
     SurfaceClosed(Id),
 }
 
 type MsgStream = Pin<Box<dyn futures_util::Stream<Item = Message> + Send + 'static>>;
 
-/// 1 s heartbeat driving the registry re-scan and the auto-dismiss timer.
+/// 1 s heartbeat driving the spool drain and the auto-dismiss timer.
 fn refresh_stream(_: &u8) -> MsgStream {
     Box::pin(stream::channel(
         1,
@@ -131,6 +224,10 @@ impl cosmic::Application for CardApp {
     }
 
     fn init(core: cosmic::Core, _flags: Self::Flags) -> (Self, Task<cosmic::Action<Self::Message>>) {
+        // Drop any events spooled before we started, so a restart doesn't replay
+        // stale cards.
+        clear_spool();
+
         let (focus_tx, focus_titles) = match focus::spawn() {
             Some((tx, titles)) => (Some(tx), Some(titles)),
             None => (None, None),
@@ -157,10 +254,22 @@ impl cosmic::Application for CardApp {
     }
 
     fn view_window(&self, id: Id) -> Element<'_, Self::Message> {
-        match self.card.as_ref().filter(|c| c.id == id) {
-            Some(card) => self.card_view(card),
-            None => widget::text("").into(),
+        if self.surface != Some(id) || self.cards.is_empty() {
+            return widget::text("").into();
         }
+        let mut row = widget::row().spacing(CARD_GAP).align_y(Alignment::Start);
+        for card in &self.cards {
+            row = row.push(card_element(card));
+        }
+        widget::autosize::autosize(row, AUTOSIZE_ID.clone())
+            .limits(
+                Limits::NONE
+                    .min_width(1.0)
+                    .min_height(1.0)
+                    .max_width(MAX_ROW_WIDTH)
+                    .max_height(260.0),
+            )
+            .into()
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -171,34 +280,36 @@ impl cosmic::Application for CardApp {
         match message {
             Message::Refresh => return self.refresh(),
 
-            Message::Focus => {
-                if let Some(card) = self.card.take() {
-                    let tx = self.focus_tx.clone();
-                    let pid = card.pid;
-                    return Task::batch([
-                        destroy_layer_surface(card.id),
-                        Task::perform(
+            Message::Focus(sid) => {
+                if let Some(pos) = self.cards.iter().position(|c| c.session_id == sid) {
+                    let card = self.cards.remove(pos);
+                    let mut tasks = Vec::new();
+                    if let Some(pid) = card.pid {
+                        let tx = self.focus_tx.clone();
+                        tasks.push(Task::perform(
                             async move {
-                                // Switch tmux to the pane (best-effort), then
-                                // ask the Wayland thread to raise the window
-                                // mapped to this session's tty.
+                                // Switch tmux to the pane (best-effort), then ask
+                                // the Wayland thread to raise the window mapped to
+                                // this session's tty.
                                 focus::tmux_switch(pid).await;
                                 tokio::time::sleep(Duration::from_millis(150)).await;
-                                if let (Some(tx), Some(tty)) =
-                                    (tx, focus::session_tty(pid).await)
-                                {
+                                if let (Some(tx), Some(tty)) = (tx, focus::session_tty(pid).await) {
                                     let _ = tx.send(focus::FocusRequest { tty });
                                 }
                             },
                             |_| cosmic::Action::App(Message::Refresh),
-                        ),
-                    ]);
+                        ));
+                    }
+                    // Tear the surface down if that was the last card.
+                    tasks.push(self.sync_surface());
+                    return Task::batch(tasks);
                 }
             }
 
             Message::SurfaceClosed(id) => {
-                if self.card.as_ref().is_some_and(|c| c.id == id) {
-                    self.card = None;
+                if self.surface == Some(id) {
+                    self.surface = None;
+                    self.cards.clear();
                 }
             }
         }
@@ -209,62 +320,104 @@ impl cosmic::Application for CardApp {
 impl CardApp {
     fn refresh(&mut self) -> Task<cosmic::Action<Message>> {
         let sessions = sessions::load(true);
-        let mut tasks = Vec::new();
 
-        // A session that has *newly* entered the waiting state. Requires a known
-        // previous state so pre-existing waiting sessions don't fire a card the
-        // moment the daemon starts.
-        let newly = sessions.iter().find(|s| {
-            matches!(
-                self.prev_states.get(&s.session_id).copied(),
-                Some(p) if p != SessionState::Attention
-            ) && s.state == SessionState::Attention
-        });
+        for ev in drain_spool() {
+            let sid = ev.hook.session_id;
+            let cwd = ev.hook.cwd;
+            let kind = match ev.event.as_str() {
+                "turnstart" => {
+                    if !sid.is_empty() {
+                        self.turn_start.insert(sid, Instant::now());
+                    }
+                    continue;
+                }
+                "stop" => {
+                    let long = self
+                        .turn_start
+                        .remove(&sid)
+                        .map(|t| t.elapsed() >= FINISHED_MIN_BUSY)
+                        // Unknown turn length (daemon started mid-turn): notify.
+                        .unwrap_or(true);
+                    if !long {
+                        continue;
+                    }
+                    CardKind::Finished
+                }
+                "error" => CardKind::Error,
+                "permission" => CardKind::Permission(ev.hook.tool_name),
+                "idle" => CardKind::Waiting,
+                _ => continue,
+            };
 
-        if let Some(s) = newly {
-            let label = self.session_label(s);
-            let project = s.project().to_string();
-            if let Some(card) = self.card.as_mut() {
-                // A card is already up — swap in the newcomer and reset its timer.
-                card.pid = s.pid;
-                card.session_id = s.session_id.clone();
-                card.label = label;
-                card.project = project;
-                card.shown_at = Instant::now();
-            } else {
-                let id = Id::unique();
-                self.card = Some(Card {
-                    id,
-                    pid: s.pid,
-                    session_id: s.session_id.clone(),
-                    label,
-                    project,
-                    shown_at: Instant::now(),
-                });
-                tasks.push(create_card_surface(id));
-            }
+            let sess = sessions.iter().find(|s| s.session_id == sid);
+            let label = sess
+                .map(|s| self.session_label(s))
+                .unwrap_or_else(|| project_of(&cwd));
+            let project = sess
+                .map(|s| s.project().to_string())
+                .unwrap_or_else(|| project_of(&cwd));
+            let pid = sess.map(|s| s.pid);
+            self.upsert_card(sid, pid, kind, label, project);
         }
 
-        self.prev_states = sessions
-            .iter()
-            .map(|s| (s.session_id.clone(), s.state))
-            .collect();
+        // Forget turn timers for sessions that are gone.
+        self.turn_start
+            .retain(|sid, _| sessions.iter().any(|s| &s.session_id == sid));
 
-        // Dismiss once the TTL elapses or the carded session stops waiting
-        // (resolved or gone). Evaluated after the swap above, so a fresh
-        // newcomer is never dismissed on the same tick.
-        if let Some(card) = self.card.as_ref() {
-            let still_waiting = sessions
-                .iter()
-                .any(|s| s.session_id == card.session_id && s.state == SessionState::Attention);
-            if !still_waiting || card.shown_at.elapsed() >= CARD_TTL {
-                let id = card.id;
-                self.card = None;
-                tasks.push(destroy_layer_surface(id));
-            }
+        // Expire old cards, then cap the count (dropping the oldest).
+        self.cards.retain(|c| c.shown_at.elapsed() < CARD_TTL);
+        if self.cards.len() > MAX_CARDS {
+            let excess = self.cards.len() - MAX_CARDS;
+            self.cards.drain(0..excess);
         }
 
-        Task::batch(tasks)
+        self.sync_surface()
+    }
+
+    /// Insert a card for a session, or update the existing one in place (resets
+    /// its dismiss timer).
+    fn upsert_card(
+        &mut self,
+        sid: String,
+        pid: Option<i32>,
+        kind: CardKind,
+        label: String,
+        project: String,
+    ) {
+        if let Some(c) = self.cards.iter_mut().find(|c| c.session_id == sid) {
+            c.pid = pid;
+            c.kind = kind;
+            c.label = label;
+            c.project = project;
+            c.shown_at = Instant::now();
+        } else {
+            self.cards.push(Card {
+                session_id: sid,
+                pid,
+                kind,
+                label,
+                project,
+                shown_at: Instant::now(),
+            });
+        }
+    }
+
+    /// Create the surface when the first card appears, destroy it when the last
+    /// one goes. (When it merely changes, `view_window` re-renders + autosize
+    /// resizes — no surface op needed.)
+    fn sync_surface(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.cards.is_empty() {
+            match self.surface.take() {
+                Some(id) => destroy_layer_surface(id),
+                None => Task::none(),
+            }
+        } else if self.surface.is_none() {
+            let id = Id::unique();
+            self.surface = Some(id);
+            create_card_surface(id)
+        } else {
+            Task::none()
+        }
     }
 
     /// Display label: the live task from the mapped window title (glyph
@@ -282,100 +435,87 @@ impl CardApp {
             .or_else(|| s.name.clone())
             .unwrap_or_else(|| s.project().to_string())
     }
+}
 
-    fn card_view(&self, card: &Card) -> Element<'_, Message> {
-        // Two stacked backgrounds: an amber "warning" layer behind a normal
-        // card-coloured panel inset 4px on the left, so the amber shows only as
-        // a rounded accent strip down the left. The panel fills the card width
-        // (so the amber never leaks into a gap on the right); height has no Fill,
-        // so the surface still hugs its content vertically.
-        let amber_bg = |theme: &cosmic::Theme| cosmic::iced_widget::container::Style {
-            background: Some(Color::from(theme.cosmic().warning.base).into()),
+/// Build one fixed-width card. Accent layer (left strip + icon) coloured per
+/// kind, behind a card-coloured panel inset 4px on the left; the panel fills
+/// the width so the accent only shows as the left strip.
+fn card_element(card: &Card) -> Element<'_, Message> {
+    let accent_kind = card.kind.clone();
+    let accent_bg = move |theme: &cosmic::Theme| cosmic::iced_widget::container::Style {
+        background: Some(accent_kind.accent(theme).into()),
+        border: cosmic::iced::Border {
+            radius: theme.cosmic().corner_radii.radius_s.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let panel_bg = |theme: &cosmic::Theme| {
+        let c = theme.cosmic();
+        cosmic::iced_widget::container::Style {
+            icon_color: Some(Color::from(c.background.component.on)),
+            text_color: Some(Color::from(c.background.component.on)),
+            background: Some(Color::from(c.background.component.base).into()),
             border: cosmic::iced::Border {
-                radius: theme.cosmic().corner_radii.radius_s.into(),
+                radius: c.corner_radii.radius_s.into(),
                 ..Default::default()
             },
             ..Default::default()
-        };
-        let panel_bg = |theme: &cosmic::Theme| {
-            let c = theme.cosmic();
-            cosmic::iced_widget::container::Style {
-                icon_color: Some(Color::from(c.background.component.on)),
-                text_color: Some(Color::from(c.background.component.on)),
-                background: Some(Color::from(c.background.component.base).into()),
-                border: cosmic::iced::Border {
-                    radius: c.corner_radii.radius_s.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        };
-
-        // Symbolic icon tinted with the same amber.
-        let icon = widget::icon::from_name("dialog-warning-symbolic")
-            .size(28)
-            .icon()
-            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
-                cosmic::iced_widget::svg::Style {
-                    color: Some(Color::from(theme.cosmic().warning.base)),
-                }
-            })));
-
-        // Bold white headline (default foreground), task, then dim project.
-        let mut text_col = widget::column()
-            .spacing(3)
-            .push(widget::text::title4("Claude needs you"))
-            .push(widget::text::body(card.label.clone()));
-        if card.project != card.label {
-            text_col = text_col.push(
-                widget::text::caption(card.project.clone())
-                    .class(Color::from_rgb(0.6, 0.6, 0.6)),
-            );
         }
+    };
 
-        let content = widget::row()
-            .push(icon)
-            .push(text_col)
-            .spacing(14)
-            .align_y(Alignment::Center)
-            .padding(18);
+    let icon_kind = card.kind.clone();
+    let icon = widget::icon::from_name(card.kind.icon_name())
+        .size(28)
+        .icon()
+        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
+            cosmic::iced_widget::svg::Style {
+                color: Some(icon_kind.accent(theme)),
+            }
+        })));
 
-        let panel = widget::container(content)
-            .width(Length::Fill)
-            .class(cosmic::theme::Container::custom(panel_bg));
-
-        let card_box = widget::container(panel)
-            .padding(cosmic::iced::Padding {
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: 4.0,
-            })
-            .class(cosmic::theme::Container::custom(amber_bg))
-            .clip(true);
-
-        // `mouse_area` makes the whole card clickable without a button's accent
-        // tint, so the headline stays white instead of going accent-teal.
-        let clickable = widget::mouse_area(card_box).on_press(Message::Focus);
-
-        widget::autosize::autosize(clickable, AUTOSIZE_ID.clone())
-            .limits(
-                // With the panel set to Length::Fill, the card width is whatever
-                // `max_width` is (the panel fills it); shrink this for a narrower
-                // card. Height still hugs content.
-                Limits::NONE
-                    .min_width(280.0)
-                    .min_height(1.0)
-                    .max_width(360.0)
-                    .max_height(260.0),
-            )
-            .into()
+    let mut text_col = widget::column()
+        .spacing(3)
+        .push(widget::text::title4(card.kind.headline()))
+        .push(widget::text::body(card.label.clone()));
+    if !card.project.is_empty() && card.project != card.label {
+        text_col = text_col.push(
+            widget::text::caption(card.project.clone()).class(Color::from_rgb(0.6, 0.6, 0.6)),
+        );
     }
+
+    let content = widget::row()
+        .push(icon)
+        .push(text_col.width(Length::Fill))
+        .spacing(14)
+        .align_y(Alignment::Center)
+        .padding(18);
+
+    let panel = widget::container(content)
+        .width(Length::Fill)
+        .class(cosmic::theme::Container::custom(panel_bg));
+
+    let card_box = widget::container(panel)
+        .width(Length::Fixed(CARD_WIDTH))
+        .padding(cosmic::iced::Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 4.0,
+        })
+        .class(cosmic::theme::Container::custom(accent_bg))
+        .clip(true);
+
+    // `mouse_area` makes the whole card clickable without a button's accent
+    // tint, so the headline stays white instead of going accent-coloured.
+    widget::mouse_area(card_box)
+        .on_press(Message::Focus(card.session_id.clone()))
+        .into()
 }
 
-/// Create the top-right layer surface for the card. `keyboard_interactivity =
-/// None` keeps it from stealing focus (it still receives pointer clicks); the
-/// autosize widget drives its size, so `size` is left unset.
+/// Create the top-left layer surface holding the row of cards.
+/// `keyboard_interactivity = None` keeps it from stealing focus (it still
+/// receives pointer clicks); the autosize widget drives its size.
 fn create_card_surface(id: Id) -> Task<cosmic::Action<Message>> {
     let settings = SctkLayerSurfaceSettings {
         id,
@@ -394,11 +534,64 @@ fn create_card_surface(id: Id) -> Task<cosmic::Action<Message>> {
         size_limits: Limits::NONE
             .min_width(1.0)
             .min_height(1.0)
-            .max_width(380.0)
-            .max_height(320.0),
+            .max_width(MAX_ROW_WIDTH)
+            .max_height(260.0),
         ..Default::default()
     };
     get_layer_surface(settings)
+}
+
+// ─── Spool ─────────────────────────────────────────────────────────────────
+
+fn spool_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".claude")
+        .join("card-events")
+}
+
+/// Read, parse and remove every spooled event, oldest first (filenames are
+/// nanosecond-timestamped).
+fn drain_spool() -> Vec<SpoolEvent> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(spool_dir()) else {
+        return out;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    for f in files {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            if let Ok(ev) = serde_json::from_str::<SpoolEvent>(&text) {
+                out.push(ev);
+            }
+        }
+        let _ = std::fs::remove_file(&f);
+    }
+    out
+}
+
+/// Delete any spooled events (called at startup).
+fn clear_spool() {
+    if let Ok(entries) = std::fs::read_dir(spool_dir()) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// The final path component of a cwd (the project dir).
+fn project_of(cwd: &str) -> String {
+    cwd.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(cwd)
+        .to_string()
 }
 
 /// Strip a leading status glyph (e.g. "✳ ", "⠂ ") from a window title.

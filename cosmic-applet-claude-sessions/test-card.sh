@@ -1,48 +1,33 @@
 #!/usr/bin/env bash
-# Trigger the cosmic-applet-claude-sessions attention card by injecting a
-# synthetic session that goes idle -> waiting (the transition that fires the
-# card). Run again to re-trigger. Run with "clean" to remove the fixture.
+# Trigger the cosmic-claude-attention-card daemon by spooling a synthetic hook
+# event (the daemon is hook-driven now, not registry-driven). Pass the kind:
 #
-#   ./test-card.sh          # trigger the card
-#   ./test-card.sh clean    # remove the synthetic session + process
+#   ./test-card.sh stop         # "Claude finished"
+#   ./test-card.sh error        # "Claude hit an error"
+#   ./test-card.sh permission   # "Claude needs permission · Bash"  (default)
+#   ./test-card.sh idle         # "Claude is waiting for you"
 #
-# Applet debug output (while testing) lands in /tmp/claude-card.log
+# Uses a fake session id, so the card shows the cwd's basename as the project
+# and clicking it won't focus a real window. For a true end-to-end test, just
+# start a *new* Claude session — the settings.json hooks fire on its Stop /
+# permission / idle events automatically.
 set -u
 
-INFO="/tmp/claude-card-test.info"
-SESSDIR="$HOME/.claude/sessions"
+kind="${1:-permission}"
+case "$kind" in
+  stop | error | permission | idle) ;;
+  *)
+    echo "usage: $0 [stop|error|permission|idle]"
+    exit 2
+    ;;
+esac
 
-remove_fixture() {
-  if [ -f "$INFO" ]; then
-    read -r pid sess < "$INFO" 2>/dev/null || true
-    [ -n "${sess:-}" ] && rm -f "$sess"
-    [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null
-    rm -f "$INFO"
-  fi
-}
+# Unique session id per run so repeated invocations stack as separate cards
+# (one card per session id; same id would just update in place).
+sid="test-$(date +%s%N)"
+payload='{"session_id":"'"$sid"'","cwd":"'"$HOME"'/lab/cosmic-apps","tool_name":"Bash"}'
+printf '%s' "$payload" | bash "$HOME/.claude/card-hook.sh" "$kind"
 
-if [ "${1:-}" = clean ]; then
-  remove_fixture
-  echo "cleaned up the test session."
-  exit 0
-fi
-
-remove_fixture
-
-# A real, alive pid so the applet's liveness check passes.
-nohup tail -f /dev/null >/dev/null 2>&1 &
-fakepid=$!
-sess="$SESSDIR/$fakepid.json"
-now=$(($(date +%s) * 1000))
-base="\"pid\":$fakepid,\"sessionId\":\"test-card\",\"cwd\":\"$HOME/lab/cosmic-apps\",\"kind\":\"interactive\",\"entrypoint\":\"cli\",\"name\":\"Test attention card\",\"startedAt\":$now,\"updatedAt\":$now"
-
-printf '{%s,"status":"idle"}\n' "$base" > "$sess"
-printf '%s %s\n' "$fakepid" "$sess" > "$INFO"
-
-# Flip to waiting after a few seconds so the applet records 'idle' first and
-# then sees the idle -> waiting transition that fires the card.
-nohup bash -c "sleep 4; printf '{%s,\"status\":\"waiting\"}\n' '$base' > '$sess'" >/dev/null 2>&1 &
-
-echo "Injected an idle session (pid $fakepid)."
-echo "Flips to 'waiting' in ~4s — watch the TOP-RIGHT of the screen for the card."
-echo "Re-run to trigger again, or '$0 clean' to remove it. Log: /tmp/claude-card.log"
+echo "Spooled a '$kind' event ($sid) — watch the top for the card (within ~1s)."
+echo "Run it a few times with different kinds to see them stack to the right:"
+echo "  $0 stop ; $0 error ; $0 permission ; $0 idle"
