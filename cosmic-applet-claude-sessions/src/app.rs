@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::config::Config;
-use crate::focus;
+use crate::ipc;
 use crate::sessions::{self, Overall, Session, SessionState};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::{stream, window::Id, Alignment, Color, Length, Limits, Subscription};
@@ -34,11 +34,20 @@ pub struct AppModel {
     /// stops being busy.
     busy_since: HashMap<String, Instant>,
 
-    /// Channel to the background Wayland thread that activates windows.
-    focus_tx: Option<focus::FocusSender>,
+    /// tty -> live window title (Claude's task topic), fetched from the
+    /// attention-card daemon over IPC each tick. Empty when the daemon is down.
+    titles: HashMap<String, String>,
 
-    /// Shared tty -> live window title (Claude's task topic), from that thread.
-    focus_titles: Option<focus::SharedTitles>,
+    /// The tty of the currently focused window (from the daemon), to mark
+    /// sessions checked.
+    focused: Option<String>,
+
+    /// Previous state per session id, to detect busy→idle (finished) transitions.
+    prev_states: HashMap<String, SessionState>,
+
+    /// Session ids that finished (busy→idle) while their terminal wasn't focused
+    /// and you haven't looked at them since.
+    finished_unchecked: HashSet<String>,
 }
 
 // ─── Messages ────────────────────────────────────────────────────────────────
@@ -47,10 +56,13 @@ pub struct AppModel {
 pub enum Message {
     TogglePopup,
     PopupClosed(Id),
-    Refresh,
+    /// 1 s heartbeat: adopt the daemon's focus state (None = daemon down),
+    /// then re-scan the registry.
+    Tick(Option<ipc::DaemonState>),
+    /// Re-scan the registry with the focus state we already have.
+    Rescan,
     Focus { pid: i32 },
     UpdateConfig(Config),
-    SetMuteFocused(bool),
 }
 
 // ─── Stream builders ─────────────────────────────────────────────────────────
@@ -62,7 +74,8 @@ pub enum Message {
 type MsgStream = Pin<Box<dyn futures_util::Stream<Item = Message> + Send + 'static>>;
 
 /// 1 s heartbeat that drives a full re-scan of the registry and the
-/// running-time counters.
+/// running-time counters. Pulls the daemon's focus state with each tick so the
+/// re-scan sees fresh titles / focused-tty.
 fn refresh_stream(_: &u8) -> MsgStream {
     Box::pin(stream::channel(
         1,
@@ -71,7 +84,8 @@ fn refresh_stream(_: &u8) -> MsgStream {
             timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
                 timer.tick().await;
-                let _ = tx.send(Message::Refresh).await;
+                let state = ipc::fetch_state().await;
+                let _ = tx.send(Message::Tick(state)).await;
             }
         },
     ))
@@ -119,22 +133,20 @@ impl cosmic::Application for AppModel {
             })
             .unwrap_or_default();
 
-        let (focus_tx, focus_titles) = match focus::spawn() {
-            Some((tx, titles, _focused)) => (Some(tx), Some(titles)),
-            None => (None, None),
-        };
         let app = AppModel {
             core,
             config,
-            focus_tx,
-            focus_titles,
             ..Default::default()
         };
 
-        // Immediate first scan at startup.
+        // Immediate first scan at startup, seeded with the daemon's state — a
+        // respawned applet (panel restarts on suspend/resume) inherits the
+        // tty→window knowledge instead of starting empty.
         (
             app,
-            Task::perform(async {}, |_| cosmic::Action::App(Message::Refresh)),
+            Task::perform(ipc::fetch_state(), |state| {
+                cosmic::Action::App(Message::Tick(state))
+            }),
         )
     }
 
@@ -145,40 +157,76 @@ impl cosmic::Application for AppModel {
     // ── Panel button ─────────────────────────────────────────────────────────
 
     fn view(&self) -> Element<'_, Self::Message> {
-        self.core
+        let icon_btn = self
+            .core
             .applet
             .icon_button(self.overall.icon_name())
-            .on_press(Message::TogglePopup)
-            .into()
+            .on_press(Message::TogglePopup);
+
+        // Badge the icon with the count of finished-but-unchecked sessions.
+        let unchecked = self.finished_unchecked.len();
+        if unchecked > 0 {
+            widget::column()
+                .push(icon_btn)
+                .push(self.core.applet.text(unchecked.to_string()))
+                .align_x(Alignment::Center)
+                .into()
+        } else {
+            icon_btn.into()
+        }
     }
 
     // ── Popup window ─────────────────────────────────────────────────────────
 
     fn view_window(&self, _id: Id) -> Element<'_, Self::Message> {
-        let display: Vec<&Session> = self
+        let mut display: Vec<&Session> = self
             .sessions
             .iter()
-            .filter(|s| self.config.show_idle || s.state != SessionState::Idle)
+            .filter(|s| {
+                self.config.show_idle
+                    || s.state != SessionState::Idle
+                    || self.finished_unchecked.contains(&s.session_id)
+            })
             .collect();
+        // Surface finished-unchecked sessions above plain-idle ones.
+        display.sort_by_key(|s| match s.state {
+            SessionState::Attention => 0,
+            SessionState::Busy => 1,
+            SessionState::Idle if self.finished_unchecked.contains(&s.session_id) => 2,
+            SessionState::Idle => 3,
+        });
+
+        let unchecked = self.finished_unchecked.len();
+        let header = if unchecked > 0 {
+            format!("Claude sessions ({}) · {} done", display.len(), unchecked)
+        } else {
+            format!("Claude sessions ({})", display.len())
+        };
 
         let mut content = widget::column()
             .spacing(8)
             .padding(12)
-            .push(widget::text(format!("Claude sessions ({})", display.len())).size(14));
+            .push(widget::text(header).size(14));
 
         if display.is_empty() {
             content = content.push(widget::text("No active Claude sessions").size(12));
         } else {
             for s in display {
-                let (color, status) = match s.state {
-                    SessionState::Attention => {
-                        (Color::from_rgb(0.85, 0.20, 0.20), "waiting".to_string())
+                let (color, status) = if self.finished_unchecked.contains(&s.session_id) {
+                    (Color::from_rgb(0.30, 0.75, 0.45), "✓ done".to_string())
+                } else {
+                    match s.state {
+                        SessionState::Attention => {
+                            (Color::from_rgb(0.85, 0.20, 0.20), "waiting".to_string())
+                        }
+                        SessionState::Busy => (
+                            Color::from_rgb(1.00, 0.65, 0.00),
+                            format!("busy {}", self.running_time(s)),
+                        ),
+                        SessionState::Idle => {
+                            (Color::from_rgb(0.50, 0.50, 0.50), "idle".to_string())
+                        }
                     }
-                    SessionState::Busy => (
-                        Color::from_rgb(1.00, 0.65, 0.00),
-                        format!("busy {}", self.running_time(s)),
-                    ),
-                    SessionState::Idle => (Color::from_rgb(0.50, 0.50, 0.50), "idle".to_string()),
                 };
 
                 // Primary label: the live task (window title), else name, else
@@ -222,12 +270,6 @@ impl cosmic::Application for AppModel {
                 );
             }
         }
-
-        content = content.push(
-            widget::toggler(self.config.mute_focused)
-                .label("Mute the focused session".to_string())
-                .on_toggle(Message::SetMuteFocused),
-        );
 
         self.core.applet.popup_container(content).into()
     }
@@ -277,50 +319,28 @@ impl cosmic::Application for AppModel {
                 }
             }
 
-            Message::Refresh => {
-                let sessions = sessions::load(true);
-                self.overall = sessions::overall(&sessions);
-
-                // Maintain busy_since: keep only still-busy ids, stamp new ones.
-                let busy_ids: HashSet<&str> = sessions
-                    .iter()
-                    .filter(|s| s.state == SessionState::Busy)
-                    .map(|s| s.session_id.as_str())
-                    .collect();
-                self.busy_since.retain(|id, _| busy_ids.contains(id.as_str()));
-                for s in &sessions {
-                    if s.state == SessionState::Busy {
-                        self.busy_since
-                            .entry(s.session_id.clone())
-                            .or_insert_with(Instant::now);
-                    }
-                }
-
-                // Attention alerts are owned by the standalone
-                // `cosmic-claude-attention-card` daemon (a custom layer-shell
-                // card), not the applet. The applet just reflects the current
-                // state in its panel icon and popup.
-                self.sessions = sessions;
+            Message::Tick(state) => {
+                let state = state.unwrap_or_default();
+                self.titles = state.titles;
+                self.focused = state.focused;
+                self.rescan();
             }
 
+            Message::Rescan => self.rescan(),
+
             Message::Focus { pid } => {
-                let tx = self.focus_tx.clone();
                 let mut tasks = vec![Task::perform(
                     async move {
-                        // Switch tmux to the pane first (best-effort), then ask
-                        // the Wayland thread to raise the window mapped to this
-                        // session's tty (captured from its "[pts/N]" title).
-                        focus::tmux_switch(pid).await;
                         // Let the popup finish closing and its focus return
-                        // settle before we activate, so activation is the LAST
-                        // focus change — otherwise the popup-close refocus can
-                        // land on the previous workspace's window.
+                        // settle before the daemon activates, so activation is
+                        // the LAST focus change — otherwise the popup-close
+                        // refocus can land on the previous workspace's window.
                         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                        if let (Some(tx), Some(tty)) = (tx, focus::session_tty(pid).await) {
-                            let _ = tx.send(focus::FocusRequest { tty });
-                        }
+                        // The daemon does the rest: tmux pane switch, then
+                        // raise the window mapped to this session's tty.
+                        ipc::send_focus(pid).await;
                     },
-                    |_| cosmic::Action::App(Message::Refresh),
+                    |_| cosmic::Action::App(Message::Rescan),
                 )];
                 if let Some(p) = self.popup.take() {
                     tasks.push(destroy_popup(p));
@@ -330,17 +350,7 @@ impl cosmic::Application for AppModel {
 
             Message::UpdateConfig(new_config) => {
                 self.config = new_config;
-                return self.update(Message::Refresh);
-            }
-
-            Message::SetMuteFocused(value) => {
-                // Persist to cosmic-config; the daemon watches the same key.
-                match cosmic_config::Config::new(Self::APP_ID, Config::VERSION) {
-                    Ok(ctx) => {
-                        let _ = self.config.set_mute_focused(&ctx, value);
-                    }
-                    Err(_) => self.config.mute_focused = value,
-                }
+                self.rescan();
             }
         }
 
@@ -355,6 +365,60 @@ impl cosmic::Application for AppModel {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 impl AppModel {
+    /// Re-scan the registry and recompute all derived state, using the focus
+    /// state (titles / focused tty) most recently fetched from the daemon.
+    fn rescan(&mut self) {
+        let sessions = sessions::load(true);
+        self.overall = sessions::overall(&sessions);
+
+        // Maintain busy_since: keep only still-busy ids, stamp new ones.
+        let busy_ids: HashSet<&str> = sessions
+            .iter()
+            .filter(|s| s.state == SessionState::Busy)
+            .map(|s| s.session_id.as_str())
+            .collect();
+        self.busy_since.retain(|id, _| busy_ids.contains(id.as_str()));
+        for s in &sessions {
+            if s.state == SessionState::Busy {
+                self.busy_since
+                    .entry(s.session_id.clone())
+                    .or_insert_with(Instant::now);
+            }
+        }
+
+        // Track "finished but unchecked": a session that went busy→idle
+        // while its terminal wasn't the focused window, and that you
+        // haven't focused since. Cleared once you focus it, or when it
+        // starts working / needs input again. (Attention banners are the
+        // daemon's job; the applet only reflects state here.)
+        for s in &sessions {
+            let was_busy =
+                self.prev_states.get(&s.session_id).copied() == Some(SessionState::Busy);
+            let is_focused = s.tty.as_ref().is_some_and(|t| Some(t) == self.focused.as_ref());
+            match s.state {
+                SessionState::Idle => {
+                    if was_busy && !is_focused {
+                        self.finished_unchecked.insert(s.session_id.clone());
+                    }
+                    if is_focused {
+                        self.finished_unchecked.remove(&s.session_id);
+                    }
+                }
+                SessionState::Busy | SessionState::Attention => {
+                    self.finished_unchecked.remove(&s.session_id);
+                }
+            }
+        }
+        let alive: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        self.finished_unchecked.retain(|id| alive.contains(id.as_str()));
+        self.prev_states = sessions
+            .iter()
+            .map(|s| (s.session_id.clone(), s.state))
+            .collect();
+
+        self.sessions = sessions;
+    }
+
     /// "m:ss" since the session became busy, or "0:00" if unknown.
     fn running_time(&self, s: &Session) -> String {
         let secs = self
@@ -370,11 +434,7 @@ impl AppModel {
     fn session_label(&self, s: &Session) -> String {
         s.tty
             .as_ref()
-            .and_then(|tty| {
-                self.focus_titles
-                    .as_ref()
-                    .and_then(|t| t.lock().ok().and_then(|m| m.get(tty).cloned()))
-            })
+            .and_then(|tty| self.titles.get(tty).cloned())
             .map(|t| strip_glyph(&t))
             .filter(|t| !t.is_empty())
             .or_else(|| s.name.clone())

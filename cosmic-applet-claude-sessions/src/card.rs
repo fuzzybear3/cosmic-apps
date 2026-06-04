@@ -28,6 +28,7 @@
 
 use crate::config::{self, Config};
 use crate::focus;
+use crate::ipc;
 use crate::sessions::{self, Session};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::{stream, window::Id, Alignment, Color, Length, Limits, Subscription};
@@ -196,7 +197,7 @@ pub enum Message {
     Focus(String),
     /// The surface was closed by the compositor.
     SurfaceClosed(Id),
-    /// The shared config changed (e.g. the mute toggle in the applet popup).
+    /// The shared config changed (cosmic-config file edited).
     UpdateConfig(Config),
 }
 
@@ -238,7 +239,13 @@ impl cosmic::Application for CardApp {
         clear_spool();
 
         let (focus_tx, focus_titles, focused_tty) = match focus::spawn() {
-            Some((tx, titles, focused)) => (Some(tx), Some(titles), Some(focused)),
+            Some((tx, titles, focused)) => {
+                // The daemon owns the only Wayland focus thread; serve its
+                // state (titles, focused tty) and click-to-focus to the panel
+                // applet over IPC.
+                ipc::spawn_server(tx.clone(), titles.clone(), focused.clone());
+                (Some(tx), Some(titles), Some(focused))
+            }
             None => (None, None, None),
         };
 
@@ -313,13 +320,14 @@ impl cosmic::Application for CardApp {
                         let tx = self.focus_tx.clone();
                         tasks.push(Task::perform(
                             async move {
-                                // Switch tmux to the pane (best-effort), then ask
-                                // the Wayland thread to raise the window mapped to
-                                // this session's tty.
-                                focus::tmux_switch(pid).await;
+                                // Let the card dismissal settle, then run the
+                                // shared focus flow (tmux switch + raise).
                                 tokio::time::sleep(Duration::from_millis(150)).await;
-                                if let (Some(tx), Some(tty)) = (tx, focus::session_tty(pid).await) {
-                                    let _ = tx.send(focus::FocusRequest { tty });
+                                if let Some(tx) = tx {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        focus::focus_session(pid, &tx)
+                                    })
+                                    .await;
                                 }
                             },
                             |_| cosmic::Action::App(Message::Refresh),

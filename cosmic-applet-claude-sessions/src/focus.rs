@@ -9,6 +9,11 @@
 //! toplevels (app_id + title) through `ext-foreign-toplevel-list` +
 //! `cosmic-toplevel-info`, and on a `FocusRequest` calls
 //! `zcosmic_toplevel_manager_v1.activate(toplevel, seat)`.
+//!
+//! Only the **daemon** runs this thread; the applet reaches it over `ipc`. The
+//! captured tty→identifier map is persisted to $XDG_RUNTIME_DIR and reloaded
+//! at startup, so a daemon restart doesn't lose mappings for sessions whose
+//! shells can no longer repaint "[pts/N]" (Claude owns their titles mid-run).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -73,15 +78,14 @@ pub fn spawn() -> Option<(FocusSender, SharedTitles, FocusedTty)> {
 }
 
 // ─── tmux ────────────────────────────────────────────────────────────────────
+//
+// Blocking helpers (`ps`/`tmux` are fast local commands). Called from the IPC
+// server thread directly, or via `spawn_blocking` from async contexts.
 
 /// Run a command, returning stdout on success. None on spawn failure or
 /// non-zero exit.
-async fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = tokio::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .await
-        .ok()?;
+fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -89,22 +93,22 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
 
 /// The controlling tty of a session's pid, e.g. "pts/10". None if it has none.
 /// This is the per-session key the window title is matched on.
-pub async fn session_tty(pid: i32) -> Option<String> {
-    let out = run_cmd("ps", &["-o", "tty=", "-p", &pid.to_string()]).await?;
+pub fn session_tty(pid: i32) -> Option<String> {
+    let out = run_cmd("ps", &["-o", "tty=", "-p", &pid.to_string()])?;
     let t = out.trim();
     (!t.is_empty() && t != "?").then(|| t.to_string())
 }
 
 /// If `pid` runs inside a tmux pane, switch tmux to it. Best-effort; no-op when
 /// tmux isn't installed or the session isn't in a pane.
-pub async fn tmux_switch(pid: i32) {
-    let Some(tty) = session_tty(pid).await else {
+pub fn tmux_switch(pid: i32) {
+    let Some(tty) = session_tty(pid) else {
         return;
     };
 
     let want = format!("/dev/{tty}");
     let fmt = "#{pane_tty} #{session_name}:#{window_index}.#{pane_index}";
-    let Some(out) = run_cmd("tmux", &["list-panes", "-a", "-F", fmt]).await else {
+    let Some(out) = run_cmd("tmux", &["list-panes", "-a", "-F", fmt]) else {
         return;
     };
 
@@ -119,12 +123,54 @@ pub async fn tmux_switch(pid: i32) {
             if let Some((window, pane)) = rest.split_once('.') {
                 let tw = format!("{session}:{window}");
                 let tp = format!("{session}:{window}.{pane}");
-                let _ = run_cmd("tmux", &["select-window", "-t", &tw]).await;
-                let _ = run_cmd("tmux", &["select-pane", "-t", &tp]).await;
-                let _ = run_cmd("tmux", &["switch-client", "-t", session]).await;
+                let _ = run_cmd("tmux", &["select-window", "-t", &tw]);
+                let _ = run_cmd("tmux", &["select-pane", "-t", &tp]);
+                let _ = run_cmd("tmux", &["switch-client", "-t", session]);
             }
         }
         break;
+    }
+}
+
+/// The full click-to-focus flow for a session: switch tmux to its pane
+/// (best-effort), then ask the Wayland thread to raise its mapped window.
+/// Blocking; the one entry point shared by the daemon's card clicks and the
+/// applet's clicks arriving over IPC.
+pub fn focus_session(pid: i32, tx: &FocusSender) {
+    tmux_switch(pid);
+    if let Some(tty) = session_tty(pid) {
+        let _ = tx.send(FocusRequest { tty });
+    }
+}
+
+// ─── Map persistence ─────────────────────────────────────────────────────────
+
+fn map_path() -> std::path::PathBuf {
+    crate::ipc::runtime_dir().join("window-map.json")
+}
+
+/// Load the persisted tty→identifier map. Empty on first run of a login
+/// session. Entries from before a compositor restart are harmlessly stale —
+/// lookups just fail until a fresh capture overwrites them.
+fn load_map() -> HashMap<String, String> {
+    std::fs::read_to_string(map_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the map (write-then-rename so a crashed write can't truncate it).
+fn save_map(map: &HashMap<String, String>) {
+    let path = map_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(json) = serde_json::to_string(map) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
@@ -170,7 +216,9 @@ fn run(
         toplevel_manager,
         registry_state,
         conn: conn.clone(),
-        tty_to_identifier: HashMap::new(),
+        // Reload mappings persisted by a previous run; the toplevel replay at
+        // connect time re-publishes titles for windows the map still covers.
+        tty_to_identifier: load_map(),
         titles,
         focused_tty,
     };
@@ -319,7 +367,10 @@ impl ToplevelInfoHandler for AppData {
         if let Some(pts) = extract_pts(&title) {
             // Shell-owned title "[pts/N] …": capture the tty -> window mapping,
             // and mark this window as having no active task.
-            self.tty_to_identifier.insert(pts.clone(), identifier);
+            if self.tty_to_identifier.get(&pts) != Some(&identifier) {
+                self.tty_to_identifier.insert(pts.clone(), identifier);
+                save_map(&self.tty_to_identifier);
+            }
             if let Ok(mut m) = self.titles.lock() {
                 m.insert(pts, String::new());
             }
@@ -356,6 +407,9 @@ impl ToplevelInfoHandler for AppData {
             .map(|(pts, _)| pts.clone())
             .collect();
         self.tty_to_identifier.retain(|_, v| *v != identifier);
+        if !stale.is_empty() {
+            save_map(&self.tty_to_identifier);
+        }
         if let Ok(mut m) = self.titles.lock() {
             for pts in stale {
                 m.remove(&pts);

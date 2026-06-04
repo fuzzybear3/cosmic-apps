@@ -18,10 +18,16 @@ focuses that session's terminal.**
 - **Roster & status** come from Claude Code's own live registry, `~/.claude/sessions/<pid>.json`
   (polled once per second; dead pids are filtered out). This layout is an internal Claude Code
   detail and may change between releases.
-- **"Needs attention"** comes from our hooks, not the registry (the stable contract). A
-  `Notification` hook runs `~/.claude/notify.sh … notify`, which drops a marker at
-  `~/.claude/attention/<session_id>`; `Stop`/`UserPromptSubmit` hooks remove it. The applet shows
-  a session as *waiting* when a marker exists and the session isn't busy.
+- **Attention cards** are the job of a companion process, `cosmic-claude-attention-card` — a
+  layer-shell daemon (run as a systemd `--user` service) that drains a hook-fed event spool
+  (`~/.claude/card-events/`) and pops a clickable card per session (finished / error / needs
+  permission / waiting).
+- **The daemon is also the focus authority.** It owns the only Wayland thread that maps sessions
+  to windows and activates them; the applet is a thin client that fetches that state (and sends
+  click-to-focus requests) over a unix socket in `$XDG_RUNTIME_DIR/cosmic-claude-sessions/`.
+  This matters because cosmic-panel respawns its applets on every suspend/resume — the daemon
+  survives, so the mapping does too. The daemon additionally persists the map to
+  `window-map.json` in the same dir, so even its own restarts keep it.
 
 ## Requirements
 
@@ -61,11 +67,12 @@ the built-in dock uses. No external helper, no Python.
 
 **Mapping a session to its window** uses the controlling **tty** as the key. A Wayland window
 exposes no pid/cwd/tty, so a zsh hook paints `[pts/N]` into the title at the shell prompt (see
-Setup). The applet records `pts/N → window` whenever it sees such a title — keyed on the window's
+Setup). The daemon records `pts/N → window` whenever it sees such a title — keyed on the window's
 stable foreign-toplevel `identifier`, so the mapping **survives Claude later overwriting the title**
 with its task topic. To focus, it derives the tty from the pid (`/proc/<pid>/fd/0`), looks up the
 cached window, and activates it. This handles multiple sessions in one project, and lets Claude
-keep auto-naming sessions and showing `✳ task` titles.
+keep auto-naming sessions and showing `✳ task` titles. The applet gets all of this from the
+daemon over IPC, so it needs no Wayland focus connection of its own.
 
 The focus action is **tmux-aware**: if the session lives in a tmux pane, it matches the session's
 pty to the pane and runs `tmux select-window`/`select-pane`/`switch-client` before raising the
@@ -91,7 +98,8 @@ Stored at `~/.config/cosmic/io.github.fuzzybear3.CosmicAppletClaudeSessions/v1/`
 ```bash
 CONFIG_DIR="$HOME/.config/cosmic/io.github.fuzzybear3.CosmicAppletClaudeSessions/v1"
 mkdir -p "$CONFIG_DIR"
-printf 'true' > "$CONFIG_DIR/show_idle"   # list idle sessions too (false = busy/waiting only)
+printf 'true' > "$CONFIG_DIR/show_idle"      # list idle sessions too (false = busy/waiting only)
+printf 'true' > "$CONFIG_DIR/mute_focused"   # daemon: skip the card for the focused session
 ```
 
 ## Project structure
@@ -101,9 +109,13 @@ cosmic-applet-claude-sessions/
 ├── Cargo.toml
 ├── resources/{app.desktop, app.metainfo.xml}
 └── src/
-    ├── main.rs       # entry point
-    ├── config.rs     # persistent config (CosmicConfigEntry)
-    ├── sessions.rs   # read ~/.claude/sessions + attention markers, derive state
-    ├── focus.rs      # native (cctk) window activation + tmux switch
-    └── app.rs        # UI + message loop (cosmic::Application)
+    ├── main.rs       # applet entry point
+    ├── bin/cosmic-claude-attention-card.rs   # daemon entry point
+    ├── lib.rs        # shared library for both binaries
+    ├── config.rs     # persistent config (CosmicConfigEntry), shared namespace
+    ├── sessions.rs   # read ~/.claude/sessions, derive per-session state
+    ├── focus.rs      # native (cctk) window activation + tmux switch (daemon-side)
+    ├── ipc.rs        # daemon ⇄ applet: focus state + click-to-focus over a unix socket
+    ├── card.rs       # attention-card daemon (layer-shell UI + event spool)
+    └── app.rs        # applet UI + message loop (cosmic::Application)
 ```
