@@ -9,7 +9,7 @@ pub enum OverallStatus {
     AllGreen,
     /// At least one run is currently queued or in progress.
     Running,
-    /// At least one run concluded with failure, cancellation, or timeout.
+    /// At least one run concluded with failure or cancellation.
     Failing,
     /// No repos configured, no token set, or no data fetched yet.
     #[default]
@@ -28,21 +28,24 @@ impl OverallStatus {
     }
 }
 
-/// A single workflow run as returned by the GitHub Actions API.
+/// A single action task as returned by the Gitea Actions API
+/// (`/repos/{owner}/{repo}/actions/tasks`). Unlike GitHub, Gitea reports a
+/// single combined `status` field instead of `status` + `conclusion`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowRun {
     pub id: u64,
     pub name: Option<String>,
     pub head_branch: Option<String>,
-    /// "queued" | "in_progress" | "completed"
+    /// "success" | "failure" | "cancelled" | "skipped" | "running" |
+    /// "waiting" | "blocked" | "unknown"
     pub status: Option<String>,
-    /// "success" | "failure" | "cancelled" | "timed_out" | "skipped" | null
-    pub conclusion: Option<String>,
-    /// ISO-8601 — when the run was created/queued.
+    /// ISO-8601 — when the task was created/queued.
     pub created_at: Option<String>,
-    /// ISO-8601 — when the run was last updated (end time for completed runs).
+    /// ISO-8601 — when the task was last updated (end time for completed runs).
     pub updated_at: Option<String>,
-    pub html_url: String,
+    /// ISO-8601 — when the task actually started executing.
+    pub run_started_at: Option<String>,
+    pub url: Option<String>,
 }
 
 fn parse_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -50,50 +53,51 @@ fn parse_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 impl WorkflowRun {
-    /// Duration in seconds for a completed run (updated_at − created_at).
+    /// When this run started executing, falling back to queue time.
+    pub fn start_ts(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.run_started_at
+            .as_deref()
+            .or(self.created_at.as_deref())
+            .and_then(parse_ts)
+    }
+
+    /// Duration in seconds for a completed run (updated_at − run_started_at).
     /// Returns None if the run is not completed or timestamps are missing.
     pub fn completed_duration_secs(&self) -> Option<f32> {
-        if self.status.as_deref() != Some("completed") {
+        if !self.is_completed() {
             return None;
         }
-        let start = parse_ts(self.created_at.as_deref()?)?;
+        let start = self.start_ts()?;
         let end = parse_ts(self.updated_at.as_deref()?)?;
         let secs = (end - start).num_seconds();
         if secs > 0 { Some(secs as f32) } else { None }
-    }
-
-    /// Elapsed seconds since this run started (for in-progress runs).
-    pub fn elapsed_secs(&self) -> Option<f32> {
-        if !self.is_running() {
-            return None;
-        }
-        let start = parse_ts(self.created_at.as_deref()?)?;
-        let elapsed = (chrono::Utc::now() - start).num_seconds();
-        if elapsed >= 0 { Some(elapsed as f32) } else { None }
     }
 }
 
 impl WorkflowRun {
     /// Human-readable status string for display.
     pub fn display_status(&self) -> &str {
-        match self.status.as_deref() {
-            Some("completed") => self.conclusion.as_deref().unwrap_or("unknown"),
-            Some(s) => s,
-            None => "unknown",
-        }
+        self.status.as_deref().unwrap_or("unknown")
+    }
+
+    pub fn is_completed(&self) -> bool {
+        matches!(
+            self.status.as_deref(),
+            Some("success") | Some("failure") | Some("cancelled") | Some("skipped")
+        )
     }
 
     pub fn is_failing(&self) -> bool {
         matches!(
-            self.conclusion.as_deref(),
-            Some("failure") | Some("timed_out") | Some("cancelled")
+            self.status.as_deref(),
+            Some("failure") | Some("cancelled")
         )
     }
 
     pub fn is_running(&self) -> bool {
         matches!(
             self.status.as_deref(),
-            Some("in_progress") | Some("queued")
+            Some("running") | Some("waiting") | Some("blocked")
         )
     }
 }
@@ -107,19 +111,25 @@ pub struct RepoRuns {
     pub error: Option<String>,
 }
 
-/// Top-level GitHub API response for the workflow runs endpoint.
+/// Top-level Gitea API response for the action tasks endpoint.
 #[derive(Deserialize)]
 struct RunsResponse {
     workflow_runs: Vec<WorkflowRun>,
 }
 
-/// Fetch the 10 most recent workflow runs for a single repository.
+/// Fetch the 10 most recent action tasks for a single repository.
 ///
 /// Always returns a `RepoRuns`; API errors are captured in `RepoRuns::error`
 /// so callers can display them inline without unwrapping.
-pub async fn fetch_runs(client: &reqwest::Client, owner: &str, repo: &str) -> RepoRuns {
+pub async fn fetch_runs(
+    client: &reqwest::Client,
+    server_url: &str,
+    owner: &str,
+    repo: &str,
+) -> RepoRuns {
+    let server = server_url.trim_end_matches('/');
     let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/actions/runs?per_page=10"
+        "{server}/api/v1/repos/{owner}/{repo}/actions/tasks?limit=10"
     );
 
     match client.get(&url).send().await {
@@ -149,26 +159,17 @@ pub async fn fetch_runs(client: &reqwest::Client, owner: &str, repo: &str) -> Re
     }
 }
 
-/// Build a `reqwest::Client` pre-configured with GitHub auth headers.
+/// Build a `reqwest::Client` pre-configured with Gitea auth headers.
 /// Call once at startup; `reqwest::Client` is cheap to clone (Arc-backed).
 pub fn build_client(token: &str) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
 
     if !token.is_empty() {
-        let auth = format!("Bearer {token}");
+        let auth = format!("token {token}");
         if let Ok(val) = reqwest::header::HeaderValue::from_str(&auth) {
             headers.insert(reqwest::header::AUTHORIZATION, val);
         }
     }
-
-    headers.insert(
-        reqwest::header::ACCEPT,
-        reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
-    );
-    headers.insert(
-        "X-GitHub-Api-Version",
-        reqwest::header::HeaderValue::from_static("2022-11-28"),
-    );
 
     reqwest::Client::builder()
         .user_agent("cosmic-applet-github-ci/0.1.0")

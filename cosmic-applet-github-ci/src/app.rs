@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::fl;
-use crate::github::{self, OverallStatus, RepoRuns};
+use crate::gitea::{self, OverallStatus, RepoRuns};
 use chrono::{DateTime, Utc};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::{stream, window::Id, Color, Length, Limits, Subscription};
@@ -62,7 +62,7 @@ pub enum Message {
 // Must be module-level `fn` items (not closures) with concrete return types so
 // they can be coerced to `fn(&D) -> S` function pointers for `Subscription::run_with`.
 
-fn github_poll_stream(
+fn gitea_poll_stream(
     interval: &u64,
 ) -> Pin<Box<dyn futures_util::Stream<Item = Message> + Send + 'static>> {
     let secs = *interval;
@@ -125,7 +125,7 @@ impl cosmic::Application for AppModel {
             })
             .unwrap_or_default();
 
-        let client = Some(github::build_client(&config.token));
+        let client = Some(gitea::build_client(&config.token));
 
         let app = AppModel {
             core,
@@ -255,9 +255,9 @@ impl cosmic::Application for AppModel {
     fn subscription(&self) -> Subscription<Self::Message> {
         let interval = self.config.refresh_interval();
 
-        // GitHub poll ticker. Identity is keyed on interval so it restarts
+        // Gitea poll ticker. Identity is keyed on interval so it restarts
         // when the user changes refresh_interval_secs in config.
-        let poll = Subscription::run_with(interval, github_poll_stream);
+        let poll = Subscription::run_with(interval, gitea_poll_stream);
 
         // Config file watcher.
         let config_watch = self
@@ -315,12 +315,14 @@ impl cosmic::Application for AppModel {
                     None => return Task::none(),
                 };
                 let repos = self.config.repos.clone();
+                let server = self.config.server_url.clone();
 
                 return Task::perform(
                     async move {
                         let mut results = Vec::with_capacity(repos.len());
                         for r in &repos {
-                            results.push(github::fetch_runs(&client, &r.owner, &r.repo).await);
+                            results
+                                .push(gitea::fetch_runs(&client, &server, &r.owner, &r.repo).await);
                         }
                         results
                     },
@@ -329,7 +331,7 @@ impl cosmic::Application for AppModel {
             }
 
             Message::RunsFetched(runs) => {
-                self.overall = github::compute_overall(&runs);
+                self.overall = gitea::compute_overall(&runs);
 
                 // Find the first running workflow and look for a previous completed
                 // run of the same name to use as a duration estimate.
@@ -343,10 +345,7 @@ impl cosmic::Application for AppModel {
                             continue;
                         }
                         // Parse start time of the currently running workflow.
-                        if let Some(start) = run.created_at.as_deref()
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                            .map(|dt| dt.with_timezone(&chrono::Utc))
-                        {
+                        if let Some(start) = run.start_ts() {
                             self.running_start = Some(start);
                         }
 
@@ -372,7 +371,7 @@ impl cosmic::Application for AppModel {
 
             Message::UpdateConfig(new_config) => {
                 if new_config.token != self.config.token {
-                    self.client = Some(github::build_client(&new_config.token));
+                    self.client = Some(gitea::build_client(&new_config.token));
                 }
                 self.config = new_config;
                 return self.update(Message::Tick);
@@ -406,9 +405,9 @@ impl cosmic::Application for AppModel {
 fn status_color(status: &str) -> Color {
     match status {
         "success" => Color::from_rgb(0.20, 0.75, 0.30),
-        "failure" | "timed_out" => Color::from_rgb(0.85, 0.20, 0.20),
-        "cancelled" => Color::from_rgb(0.60, 0.60, 0.60),
-        "in_progress" | "queued" => Color::from_rgb(1.00, 0.65, 0.00),
+        "failure" => Color::from_rgb(0.85, 0.20, 0.20),
+        "cancelled" | "skipped" => Color::from_rgb(0.60, 0.60, 0.60),
+        "running" | "waiting" | "blocked" => Color::from_rgb(1.00, 0.65, 0.00),
         _ => Color::from_rgb(0.50, 0.50, 0.50),
     }
 }

@@ -2,7 +2,7 @@
 
 mod app;
 mod config;
-mod github;
+mod gitea;
 mod i18n;
 
 fn main() -> cosmic::iced::Result {

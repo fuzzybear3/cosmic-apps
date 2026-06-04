@@ -3,7 +3,7 @@ name = "cosmic-applet-github-ci"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "COSMIC panel applet showing GitHub Actions CI/CD workflow status"
+description = "COSMIC panel applet showing Gitea Actions CI/CD workflow status"
 repository = "https://github.com/fuzzybear3/cosmic-apps"
 
 [[bin]]
