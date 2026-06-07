@@ -187,6 +187,15 @@ impl cosmic::Application for AppModel {
                     widget::text(header).size(14).width(Length::Fill),
                 );
 
+                if repo_runs.offline {
+                    content = content.push(
+                        widget::text(format!("  {}", fl!("offline")))
+                            .size(11)
+                            .class(Color::from_rgb(0.55, 0.55, 0.55)),
+                    );
+                    continue;
+                }
+
                 if let Some(ref err) = repo_runs.error {
                     content = content.push(
                         widget::text(format!("  Error: {err}"))

@@ -11,6 +11,8 @@ pub enum OverallStatus {
     Running,
     /// At least one run concluded with failure or cancellation.
     Failing,
+    /// Server unreachable at the network level (off-network, down, or timeout).
+    Offline,
     /// No repos configured, no token set, or no data fetched yet.
     #[default]
     Unknown,
@@ -23,6 +25,7 @@ impl OverallStatus {
             Self::AllGreen => "emblem-ok-symbolic",
             Self::Running => "emblem-synchronizing-symbolic",
             Self::Failing => "emblem-important-symbolic",
+            Self::Offline => "network-offline-symbolic",
             Self::Unknown => "dialog-question-symbolic",
         }
     }
@@ -109,6 +112,9 @@ pub struct RepoRuns {
     pub repo: String,
     pub runs: Vec<WorkflowRun>,
     pub error: Option<String>,
+    /// True when the request never reached the server (DNS/connect/timeout),
+    /// as opposed to an API-level error. Drives the Offline status.
+    pub offline: bool,
 }
 
 /// Top-level Gitea API response for the action tasks endpoint.
@@ -133,11 +139,14 @@ pub async fn fetch_runs(
     );
 
     match client.get(&url).send().await {
+        // `send()` only fails at the transport level (DNS, connect, timeout),
+        // so treat any send error as the server being unreachable.
         Err(e) => RepoRuns {
             owner: owner.to_owned(),
             repo: repo.to_owned(),
             runs: vec![],
             error: Some(e.to_string()),
+            offline: true,
         },
         Ok(resp) => {
             let status = resp.status();
@@ -147,12 +156,14 @@ pub async fn fetch_runs(
                     repo: repo.to_owned(),
                     runs: body.workflow_runs,
                     error: None,
+                    offline: false,
                 },
                 Err(e) => RepoRuns {
                     owner: owner.to_owned(),
                     repo: repo.to_owned(),
                     runs: vec![],
                     error: Some(format!("HTTP {status}: {e}")),
+                    offline: false,
                 },
             }
         }
@@ -182,6 +193,11 @@ pub fn build_client(token: &str) -> reqwest::Client {
 pub fn compute_overall(all_runs: &[RepoRuns]) -> OverallStatus {
     if all_runs.is_empty() {
         return OverallStatus::Unknown;
+    }
+
+    // Every repo failed at the network level → we're off the Gitea network.
+    if all_runs.iter().all(|r| r.offline) {
+        return OverallStatus::Offline;
     }
 
     let mut any_run_seen = false;
